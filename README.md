@@ -8,12 +8,12 @@ One line of horror (102 characters): a tenant discovers an extra bedroom that al
 
 ## How it works
 
-1. `entry_path()` locates `entry.txt` next to `main.py`, wherever the repo is checked out.
-2. `load_raw()` reads that file as raw bytes, so nothing is ever re-encoded or re-wrapped.
-3. `decode()` decodes the bytes as UTF-8 and drops only the file's single trailing line ending for validation; any other leading or trailing space is part of the entry and is rejected.
-4. `gate_violations()` collects every broken rule at once — empty or whitespace-only text, length outside 1–200 characters, embedded line breaks, tabs, control characters, or a second sentence hiding after the first — and `validate()` refuses the entry with all of them named.
-5. `resolve_output_dir()` picks the destination — `--output-dir`, else `$MAKEFUN_OUTPUT_DIR`, else `/output`.
-6. `publish()` writes the raw bytes verbatim to `<output-dir>/entry.txt`, then reads the file back and compares bytes; a mismatch is a hard failure. The published file is therefore byte-identical to `entry.txt`, trailing newline included.
+1. `Entry.load()` reads `entry.txt` next to `main.py`, wherever the repo is checked out, and returns a frozen dataclass pairing the raw bytes with the decoded text, so no caller can validate one file and publish another. Decoding drops only the file's single trailing line ending for validation; any other leading or trailing space is part of the entry and is rejected.
+2. The gate is a registry of small rule functions (`RULES`): `rule_no_edge_space`, `rule_length` (1–200 characters), `rule_single_line`, `rule_no_controls`, and `rule_one_sentence` (a sentence-ending mark followed by more words means a second sentence snuck in). Each rule returns one violation message or `None`.
+3. `evaluate()` runs the registry and collects every violation at once — `rule_not_empty` short-circuits it for an empty or whitespace-only entry — and `run()` refuses the entry with all of them named.
+4. `pick_output_dir()` picks the destination — `--output-dir`, else `$MAKEFUN_OUTPUT_DIR`, else `/output`.
+5. `publish()` stages the raw bytes in a temporary file beside the final path, checks the staged copy by SHA-256 (`digest()`), and moves it into place with `os.replace` only when the digest matches; it then reads the published file back and compares it byte for byte and by digest. The published file is therefore byte-identical to `entry.txt`, trailing newline included, and a failed write can never leave a half-written entry behind.
+6. `summary()` reports the entry as characters and bytes for the success messages.
 
 Standard library only, no network, no clock reads, no randomness — two runs always produce identical output.
 

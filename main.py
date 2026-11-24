@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Publish the one-line horror entry for the make.fun bounty
-"One Line, One Chill".
+"One Line, One Chill" — revision v3 (rule registry).
 
-The scare lives in ``entry.txt`` next to this file: a single sentence
-of horror, under 200 characters, that has to frighten a reader in one
-breath. This program reads that file as raw bytes, decodes it as
-UTF-8, checks the single line against the bounty gate (1 to 200
-characters, not only white space, no embedded line breaks), and
-publishes the raw bytes verbatim to ``entry.txt`` in the output
-directory. Publishing is byte-for-byte: the trailing newline in
-``entry.txt`` is formatting of the source file and is carried over
-unchanged, never stripped, so the published file is identical to the
-source file. After writing, the program reads the published file
-back and compares bytes; a mismatch is a hard failure. The gate
-also insists on a single sentence, so a line that wanders into a
-second sentence is rejected before anything is published.
+The scare lives in ``entry.txt`` next to this file: a single
+sentence of horror, under 200 characters, that has to frighten a
+reader in one breath. The gate here is a registry of small rule
+functions: each rule takes the decoded text and the length limit
+and returns one violation message, or ``None`` when the text
+passes that rule. :func:`evaluate` runs the registry and collects
+every violation at once; :func:`publish` then writes the raw bytes
+verbatim to ``entry.txt`` in the output directory, verifying the
+staged copy and the published file by SHA-256 as well as by
+direct byte comparison. Publishing is byte-for-byte: the trailing
+newline in ``entry.txt`` is formatting of the source file and is
+carried over unchanged, never stripped, so the published file is
+identical to the source file.
 
 Standard library only: no network access, no clock reads, no
 randomness, so two runs always produce identical output.
@@ -25,143 +25,214 @@ The output directory is ``--output-dir`` when given, else
 """
 
 import argparse
+import hashlib
 import os
 import sys
+import tempfile
 import typing
+from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_MAX_CHARS = 200
+MAX_CHARS = 200
 MIN_CHARS = 1
 DEFAULT_OUTPUT_DIR = "/output"
 ENTRY_FILENAME = "entry.txt"
 
-
-def entry_path() -> Path:
-    """Return the path of the entry file shipped with this program."""
-    return Path(__file__).resolve().parent / ENTRY_FILENAME
+Rule = typing.Callable[[str, int], typing.Optional[str]]
 
 
-def load_raw(path: Path) -> bytes:
-    """Read the entry file as raw bytes, failing loudly if unreadable."""
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
-        raise SystemExit(f"entry file not found: {path}")
-    except OSError as exc:
-        raise SystemExit(f"cannot read entry file {path}: {exc}")
+@dataclass(frozen=True)
+class Entry:
+    """One entry, kept as a pair so the two can never drift apart.
 
-
-def decode(raw: bytes) -> str:
-    """Decode raw entry bytes as UTF-8 and drop the one trailing newline.
-
-    Only the file's single trailing line ending (``\\n`` or ``\\r\\n``)
-    is formatting and is removed for validation. Every other byte,
-    including any leading or trailing space, is part of the entry and
-    is rejected by :func:`validate` below, so a stray space cannot
-    slip through unnoticed.
+    ``raw`` is the exact bytes that get published verbatim;
+    ``text`` is those bytes decoded as UTF-8, which the gate
+    checks. A function that takes an ``Entry`` validates the same
+    bytes it publishes.
     """
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise SystemExit(f"entry is not valid UTF-8: {exc}")
-    if text.endswith("\r\n"):
-        return text[:-2]
-    if text.endswith("\n") or text.endswith("\r"):
-        return text[:-1]
-    return text
+
+    raw: bytes
+    text: str
+
+    @classmethod
+    def load(cls) -> "Entry":
+        """Read the shipped ``entry.txt`` and decode it for the gate."""
+        path = Path(__file__).resolve().parent / ENTRY_FILENAME
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            raise SystemExit(f"entry file not found: {path}")
+        except OSError as exc:
+            raise SystemExit(f"cannot read entry file {path}: {exc}")
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SystemExit(f"entry is not valid UTF-8: {exc}")
+        # Only the file's single trailing line ending is
+        # formatting and is removed for validation; every other
+        # byte is part of the entry and is rejected by the rules.
+        if decoded.endswith("\r\n"):
+            decoded = decoded[:-2]
+        elif decoded.endswith("\n") or decoded.endswith("\r"):
+            decoded = decoded[:-1]
+        return cls(raw=raw, text=decoded)
 
 
-def fail(message: str) -> "typing.NoReturn":
-    """Abort with a single clear error line on stderr (exit code 1)."""
-    print(f"error: {message}", file=sys.stderr)
-    raise SystemExit(1)
+def rule_not_empty(text: str, limit: int) -> typing.Optional[str]:
+    """Reject an entry that is empty or only white space.
 
-
-def gate_violations(text: str, max_chars: int) -> list:
-    """Collect every way the text breaks the bounty gate, in order.
-
-    Each violation is a plain sentence naming the rule and the
-    offending detail, so one run reports everything wrong at once
-    instead of stopping at the first problem. An empty list means
-    the text passes the gate.
+    This rule runs before the registry: no other rule can be
+    judged on nothing, so it short-circuits the rest.
     """
-    problems = []
     if not text or text.isspace():
-        problems.append("entry is empty or only white space")
-        return problems
+        return "entry is empty or only white space"
+    return None
+
+
+def rule_no_edge_space(text: str, limit: int) -> typing.Optional[str]:
+    """Reject leading or trailing whitespace around the line."""
     if text != text.strip():
-        problems.append("entry has leading or trailing whitespace")
+        return "entry has leading or trailing whitespace"
+    return None
+
+
+def rule_length(text: str, limit: int) -> typing.Optional[str]:
+    """Reject a line outside the 1-to-limit character gate."""
     if len(text) < MIN_CHARS:
-        problems.append(
+        return (
             f"entry is {len(text)} characters, below the "
             f"{MIN_CHARS}-character minimum"
         )
-    if len(text) > max_chars:
-        problems.append(
+    if len(text) > limit:
+        return (
             f"entry is {len(text)} characters, over the "
-            f"{max_chars}-character limit"
+            f"{limit}-character limit"
         )
+    return None
+
+
+def rule_single_line(text: str, limit: int) -> typing.Optional[str]:
+    """Reject embedded line breaks and tab characters."""
     if "\n" in text or "\r" in text:
-        problems.append("entry must be a single line")
+        return "entry must be a single line"
     if "\t" in text:
-        problems.append("entry must not contain a tab character")
-    bad = [ch for ch in text if ord(ch) < 32 or ord(ch) == 127]
-    if bad:
-        problems.append(
-            "entry must not contain control characters "
-            f"(found U+{ord(bad[0]):04X})"
-        )
-    # The bounty asks for one sentence: a sentence-ending mark
-    # followed by more words means a second sentence snuck in.
-    body = text[:-1] if text[-1] in ".!?" else text
-    if any(mark in body for mark in (". ", "! ", "? ")):
-        problems.append("entry must be a single sentence, not two")
-    return problems
+        return "entry must not contain a tab character"
+    return None
 
 
-def validate(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> None:
-    """Reject any entry that breaks the bounty gate, naming each reason."""
-    problems = gate_violations(text, max_chars)
-    if problems:
-        fail("; ".join(problems))
+def rule_no_controls(text: str, limit: int) -> typing.Optional[str]:
+    """Reject control characters anywhere in the line."""
+    for ch in text:
+        if ord(ch) < 32 or ord(ch) == 127:
+            return (
+                "entry must not contain control characters "
+                f"(found U+{ord(ch):04X})"
+            )
+    return None
 
 
-def resolve_output_dir(args: argparse.Namespace) -> Path:
+def rule_one_sentence(text: str, limit: int) -> typing.Optional[str]:
+    """Reject a second sentence hiding after the first.
+
+    A sentence-ending mark followed by more words means a second
+    sentence snuck in; the final mark of the one sentence is
+    followed by nothing, so it never counts.
+    """
+    core = text[:-1] if text and text[-1] in ".!?" else text
+    if any(mark in core for mark in (". ", "! ", "? ")):
+        return "entry must be a single sentence, not two"
+    return None
+
+
+RULES: typing.List[Rule] = [
+    rule_no_edge_space,
+    rule_length,
+    rule_single_line,
+    rule_no_controls,
+    rule_one_sentence,
+]
+
+
+def evaluate(text: str, limit: int) -> list:
+    """Run the rule registry and collect every violation, in order.
+
+    An empty or whitespace-only text short-circuits the registry.
+    Otherwise each rule contributes at most one message, so one run
+    reports everything wrong at once. An empty list means the text
+    passes the gate.
+    """
+    head = rule_not_empty(text, limit)
+    if head is not None:
+        return [head]
+    return [msg for rule in RULES if (msg := rule(text, limit)) is not None]
+
+
+def pick_output_dir(cli_dir) -> Path:
     """Pick the output directory: CLI flag beats env var beats default."""
-    if args.output_dir:
-        return Path(args.output_dir)
-    return Path(os.environ.get("MAKEFUN_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
+    if cli_dir:
+        return Path(cli_dir)
+    env_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return Path(DEFAULT_OUTPUT_DIR)
 
 
-def publish(raw: bytes, out_dir: Path) -> tuple:
-    """Write the raw entry bytes verbatim and verify them by re-reading.
+def digest(data: bytes) -> str:
+    """Return the SHA-256 hex digest of ``data``."""
+    return hashlib.sha256(data).hexdigest()
 
-    Returns ``(path_written, byte_count)``. Raises SystemExit if the
-    directory cannot be created, the write fails, or the bytes read
-    back do not match the bytes written. The destination is resolved
-    first so a surprising ``--output-dir`` (a symlink escaping the
-    intended tree, for instance) is visible in the success message
-    rather than silently honoured.
+
+def publish(entry: Entry, out_dir: Path) -> Path:
+    """Write the raw entry bytes verbatim and verify them twice.
+
+    Returns the path written. The bytes are staged in a temporary
+    file beside the final path and moved into place with
+    :func:`os.replace` only after the staged copy matches the
+    source by SHA-256, so a failed write can never leave a
+    half-written ``entry.txt`` behind. The published file is then
+    read back and compared byte for byte and by digest; a mismatch
+    at either step is a hard failure.
     """
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise SystemExit(f"cannot create output directory {out_dir}: {exc}")
     out_path = out_dir.resolve() / ENTRY_FILENAME
+    staged_name = None
     try:
-        out_path.write_bytes(raw)
-    except OSError as exc:
-        raise SystemExit(f"cannot write {out_path}: {exc}")
+        with tempfile.NamedTemporaryFile(
+            prefix=ENTRY_FILENAME + ".", dir=str(out_path.parent), delete=False
+        ) as handle:
+            staged_name = handle.name
+            handle.write(entry.raw)
+        staged = Path(staged_name).read_bytes()
+        if digest(staged) != digest(entry.raw):
+            raise SystemExit("staged entry does not match entry.txt")
+        try:
+            os.replace(staged_name, out_path)
+        except OSError as exc:
+            raise SystemExit(f"cannot publish {out_path}: {exc}")
+    finally:
+        if staged_name is not None:
+            try:
+                Path(staged_name).unlink(missing_ok=True)
+            except OSError:
+                pass
     try:
         published = out_path.read_bytes()
     except OSError as exc:
         raise SystemExit(f"cannot read back {out_path}: {exc}")
-    if published != raw:
+    if published != entry.raw or digest(published) != digest(entry.raw):
         raise SystemExit("published entry does not match entry.txt")
-    return out_path, len(published)
+    return out_path
 
 
-def parse_args(argv=None) -> argparse.Namespace:
+def summary(entry: Entry) -> str:
+    """Summarise the entry in one line for success messages."""
+    return f"{len(entry.text)} characters, {len(entry.raw)} bytes on disk"
+
+
+def parse_options(argv=None) -> argparse.Namespace:
     """Parse the command-line options for this publisher."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -178,8 +249,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--max-chars",
         type=int,
-        default=DEFAULT_MAX_CHARS,
-        help=f"maximum entry length in characters (default: {DEFAULT_MAX_CHARS})",
+        default=MAX_CHARS,
+        help=f"maximum entry length in characters (default: {MAX_CHARS})",
     )
     parser.add_argument(
         "--quiet",
@@ -189,28 +260,34 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv=None) -> int:
+def run(argv=None) -> int:
     """Load, validate, and publish (or just verify) the entry."""
-    args = parse_args(argv)
+    args = parse_options(argv)
     if args.max_chars < MIN_CHARS:
-        fail(f"--max-chars must be at least {MIN_CHARS}, got {args.max_chars}")
-    raw = load_raw(entry_path())
-    text = decode(raw)
-    validate(text, args.max_chars)
+        print(
+            f"error: --max-chars must be at least {MIN_CHARS}, "
+            f"got {args.max_chars}",
+            file=sys.stderr,
+        )
+        return 1
+    entry = Entry.load()
+    problems = evaluate(entry.text, args.max_chars)
+    if problems:
+        print(f"error: {'; '.join(problems)}", file=sys.stderr)
+        return 1
     if args.verify_only:
         if not args.quiet:
-            print(
-                f"Valid: {len(text)} characters, "
-                f"{len(raw)} bytes on disk"
-            )
+            print(f"Valid: {summary(entry)}")
         return 0
-    out_path, byte_count = publish(raw, resolve_output_dir(args))
+    out_path = publish(entry, pick_output_dir(args.output_dir))
     if not args.quiet:
-        print(
-            f"Wrote {len(text)} characters "
-            f"({byte_count} bytes) to {out_path}"
-        )
+        print(f"Wrote {summary(entry)} to {out_path}")
     return 0
+
+
+def main(argv=None) -> int:
+    """Command-line entry point: run the publisher and exit."""
+    return run(argv)
 
 
 if __name__ == "__main__":
